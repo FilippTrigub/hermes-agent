@@ -1383,8 +1383,45 @@ def _scan_assembled_cron_prompt(
 def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """Execute a single cron job, applying any per-job profile override."""
     job_id = job["id"]
+    # Prime os.environ from the profile .env BEFORE _job_profile_context takes
+    # its snapshot. Sequential (profile/workdir) jobs block the ticker thread
+    # for their full duration; if the host suspends mid-job, on resume the
+    # inactivity timeout fires, the context's finally restores the now-stale
+    # snapshot, and any vars added after snapshot time would be wiped. Loading
+    # first makes that restore land on a fully-populated env (idempotent).
+    _prime_profile_env(job_id, job.get("profile"))
     with _job_profile_context(job_id, job.get("profile")):
         return _run_job_impl(job)
+
+
+def _prime_profile_env(job_id: str, profile: Optional[str]) -> None:
+    """Load the resolved profile's .env into os.environ.
+
+    Resolves the profile home the same way _job_profile_context does so the
+    snapshot taken there captures a complete environment.
+    """
+    raw_profile = str(profile or "").strip()
+    if not raw_profile:
+        return
+    from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+
+    try:
+        profile_home = Path(
+            resolve_profile_env(normalize_profile_name(raw_profile))
+        ).resolve()
+    except (FileNotFoundError, ValueError) as exc:
+        logger.warning(
+            "Job '%s': cannot pre-load profile %r env (%s)",
+            job_id, raw_profile, exc,
+        )
+        return
+
+    from dotenv import load_dotenv
+
+    try:
+        load_dotenv(str(profile_home / ".env"), override=True, encoding="utf-8")
+    except UnicodeDecodeError:
+        load_dotenv(str(profile_home / ".env"), override=True, encoding="latin-1")
 
 
 def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
