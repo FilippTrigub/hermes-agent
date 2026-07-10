@@ -110,6 +110,18 @@ class TestApplyWalWithFallback:
         assert mode == "delete"
         conn.close()
 
+    def test_falls_back_on_database_is_locked(self, tmp_path):
+        """Azure Files SMB raises 'database is locked' instead of 'locking
+        protocol' for the same underlying WAL-incompatibility — must also
+        fall back to DELETE rather than propagating and crashing gateway
+        startup (ResponseStore/SessionDB init)."""
+        conn, _ = _open_blocking(
+            tmp_path / "azurefiles.db", reason="database is locked", isolation_level=None
+        )
+        mode = apply_wal_with_fallback(conn)
+        assert mode == "delete"
+        conn.close()
+
     def test_reraises_on_disk_io_error(self, tmp_path):
         """Transient EIO from ``PRAGMA journal_mode=WAL`` must NOT silently
         downgrade to DELETE.
@@ -134,14 +146,13 @@ class TestApplyWalWithFallback:
         """Refuse to downgrade an already-WAL DB even if the set-pragma path
         would have raised a downgrade-eligible marker.
 
-        With the WAL-skip patch, the read-only probe short-circuits before
-        ``PRAGMA journal_mode=WAL`` ever runs on an already-WAL connection,
-        so the set-pragma path is unreachable here and ``attempts`` stays 0.
-        Either outcome (skip-via-probe OR re-raise-on-disk-check) preserves
-        the property this test guards: we never silently DELETE-downgrade
-        a WAL-mode file. The on-disk guard remains in place as
-        belt-and-suspenders for any future code path that bypasses the
-        probe.
+        The read-only probe at the top of ``apply_wal_with_fallback`` short-
+        circuits before ``PRAGMA journal_mode=WAL`` ever runs on an already-
+        WAL connection, so the set-pragma path is unreachable here and
+        ``attempts`` stays 0. This is the only downgrade-protection left in
+        the function (the post-failure on-disk re-check inside the except
+        block was removed — see ``test_falls_back_even_when_same_connection_
+        reports_wal_after_failed_attempt`` for why).
         """
         # Prime the file in WAL mode using a normal connection
         primer = sqlite3.connect(
@@ -182,6 +193,54 @@ class TestApplyWalWithFallback:
             )
         finally:
             check.close()
+
+    def test_falls_back_even_when_same_connection_reports_wal_after_failed_attempt(
+        self, tmp_path
+    ):
+        """Regression: on Azure Files SMB, a *failed* set-WAL pragma still
+        leaves the same connection reporting journal_mode=wal on the very
+        next read — even though no WAL/SHM infrastructure was ever actually
+        created. A prior version of this function re-checked the on-disk
+        mode on that same tainted connection after catching the marker-
+        matched error, saw "wal", and refused to downgrade — permanently
+        crashing every fresh profile's first gateway start on that
+        filesystem (frank-ingest's Hermes deployment hit this in production
+        via ``ResponseStore.__init__`` / ``SessionDB.__init__``).
+
+        This must fall back to DELETE regardless: if the marker already
+        proves this filesystem can't do WAL, no other process could have
+        legitimately gotten real WAL working on it either, so there is
+        nothing left to protect against.
+        """
+
+        class _SelfInflictedWalResidueConnection(sqlite3.Connection):
+            _attempted_wal = False
+
+            def execute(self, sql, *args, **kwargs):  # type: ignore[override]
+                normalized = sql.lower().replace(" ", "")
+                if "journal_mode=wal" in normalized:
+                    self._attempted_wal = True
+                    raise sqlite3.OperationalError("database is locked")
+                if normalized == "pragmajournal_mode" and self._attempted_wal:
+                    # Simulate the same connection reporting "wal" residue
+                    # only *after* its own failed set-attempt above — the
+                    # very first (pre-attempt) probe must still see the
+                    # real, fresh (non-wal) on-disk state.
+                    class _Row:
+                        def fetchone(self_inner):
+                            return ("wal",)
+
+                    return _Row()
+                return super().execute(sql, *args, **kwargs)
+
+        conn = sqlite3.connect(
+            str(tmp_path / "smb.db"),
+            factory=_SelfInflictedWalResidueConnection,
+            isolation_level=None,
+        )
+        mode = apply_wal_with_fallback(conn, db_label="test-smb.db")
+        assert mode == "delete"
+        conn.close()
 
     def test_reraises_unrelated_operational_error(self, tmp_path):
         """Non-WAL-compat errors must NOT be silently swallowed by the fallback."""

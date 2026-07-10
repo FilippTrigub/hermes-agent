@@ -1,0 +1,17 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+# frank-control finish script. Companion to ./run — same pattern as
+# docker/s6-rc.d/dashboard/finish: when HERMES_FRANK_CONTROL is unset, ./run
+# exits 0 immediately, and this exits 125 (s6's permanent-failure marker) so
+# s6-supervise doesn't tight-loop restarting it and s6-svstat reports the
+# slot as down, matching reality. When enabled, exit non-125 so a crash gets
+# restarted.
+
+case "${HERMES_FRANK_CONTROL:-}" in
+    1|true|TRUE|True|yes|YES|Yes)
+        exit 0
+        ;;
+    *)
+        exit 125
+        ;;
+esac

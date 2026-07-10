@@ -1,0 +1,36 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+# frank-control service — control-plane API for the frank-ingest campaign
+# integration (frank_control/app.py). Always declared so s6 has a supervised
+# slot; if HERMES_FRANK_CONTROL isn't truthy the run script exits cleanly and
+# the companion finish script returns 125 ("permanent failure, do not
+# restart"), so s6-svstat reports the slot as down. Mirrors
+# docker/s6-rc.d/dashboard/run's enable-gate pattern exactly.
+
+case "${HERMES_FRANK_CONTROL:-}" in
+    1|true|TRUE|True|yes|YES|Yes) ;;
+    *)
+        exit 0
+        ;;
+esac
+
+export HOME=/opt/data
+
+cd /opt/data
+# shellcheck disable=SC1091
+. /opt/hermes/.venv/bin/activate
+
+fc_host="${FRANK_CONTROL_HOST:-0.0.0.0}"
+fc_port="${FRANK_CONTROL_PORT:-8910}"
+
+# frank-control has its own bearer-secret auth (FRANK_PROVISION_SECRET,
+# checked inside frank_control/app.py) — it is not gated by the dashboard's
+# cookie/OAuth auth framework, so no DashboardAuthProvider is required here.
+#
+# --app-dir /opt/hermes: frank_control/ is a plain source directory under
+# the WORKDIR (/opt/hermes), never pip-installed into site-packages. cwd is
+# /opt/data (set above, to match every other service's HOME convention), so
+# without this uvicorn can't find the `frank_control` module to import.
+[ "$(id -u)" = 0 ] || exec python -m uvicorn frank_control.app:app --app-dir /opt/hermes --host "$fc_host" --port "$fc_port"
+exec s6-setuidgid hermes python -m uvicorn frank_control.app:app \
+    --app-dir /opt/hermes --host "$fc_host" --port "$fc_port"

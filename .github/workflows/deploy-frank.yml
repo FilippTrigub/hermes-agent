@@ -1,0 +1,109 @@
+name: Build and deploy frank-hermes to its VM
+
+# Deploys the frank-ingest campaign integration (frank_control/ + the s6
+# frank-control service) to a dedicated Azure VM (frank-hermes-vm) in
+# frank-ingest's existing resource group (frank-ingest-rg) — not the
+# frank-ingest-env Container Apps environment. Moved off Container Apps +
+# Azure Files (2026-07-10, see docs/azure-files-smb-blocker.md) because
+# Azure Files SMB does not give SQLite (every Hermes profile's state.db/
+# response_store.db/kanban.db) reliable locking guarantees; the VM's local
+# OS disk does. See docs/azure-deployment.md for the full VM topology.
+#
+# Mirrors frank-ingest's own .github/workflows/deploy.yml shape for the
+# build step (az acr build, no IaC tool). The deploy step runs a remote
+# script on the VM via `az vm run-command invoke` (no SSH key needed in
+# CI): it reads the currently-running container's own HERMES_*/FRANK_* env
+# vars and recreates it with the new image, so no secret values are ever
+# passed through GitHub Actions. The VM itself (network, Docker install,
+# initial container run, env vars) is provisioned once via documented
+# one-off `az` commands — see docs/azure-deployment.md — not by this workflow.
+
+on:
+  push:
+    branches: [frank-quincy-integration]
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # required for OIDC
+  contents: read
+
+env:
+  REGISTRY: frankingestablcr.azurecr.io
+  IMAGE: frankingestablcr.azurecr.io/frank-hermes
+  RESOURCE_GROUP: frank-ingest-rg
+  VM_NAME: frank-hermes-vm
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          # TODO: replace with the client-id of a NEW Azure AD app
+          # registration + federated credential scoped to
+          # FilippTrigub/hermes-agent (branch frank-quincy-integration) —
+          # do not reuse frank-ingest's client-id, its federated credential
+          # subject claim is scoped to a different repo. See
+          # docs/azure-deployment.md for the one-off setup commands.
+          client-id: ${{ secrets.AZURE_HERMES_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        # NOT `az acr build`: ACR Tasks' classic builder doesn't support the
+        # Dockerfile's `--chmod` COPY flag, which needs BuildKit (confirmed
+        # live 2026-07-11 — az acr build fails at the uv COPY step with
+        # "the --chmod option requires BuildKit"). az acr login reuses the
+        # already-authenticated OIDC session from the step above.
+        run: |
+          az acr login --name frankingestablcr
+          docker buildx build --push -t ${{ env.IMAGE }}:${{ github.sha }} .
+
+      - name: Deploy new image to the VM
+        run: |
+          cat > redeploy.sh <<'SCRIPT'
+          #!/bin/bash
+          set -euxo pipefail
+          IMAGE="$1"
+
+          # Reuse the running container's own HERMES_*/FRANK_* env vars —
+          # no secret values are passed through CI. Requires frank-hermes
+          # to already be running (true after the one-off initial `docker
+          # run` documented in docs/azure-deployment.md). Each var becomes
+          # its own `-e` + value array entry (not one combined string —
+          # combining them silently drops every env var, since Docker's
+          # arg parser doesn't split "-e VAR=VAL" back into two tokens;
+          # confirmed live 2026-07-11, which briefly took frank-control
+          # down after a test redeploy).
+          mapfile -t ENV_VARS < <(
+            docker inspect frank-hermes --format '{{range .Config.Env}}{{println .}}{{end}}' \
+              | grep -E '^(HERMES_|FRANK_)'
+          )
+          ENV_FLAGS=()
+          for v in "${ENV_VARS[@]}"; do
+            ENV_FLAGS+=(-e "$v")
+          done
+
+          docker pull "$IMAGE"
+          docker stop frank-hermes
+          docker rm frank-hermes
+          docker run -d --name frank-hermes --restart unless-stopped \
+            -p 8910:8910 \
+            -v /opt/hermes-data:/opt/data \
+            "${ENV_FLAGS[@]}" \
+            "$IMAGE" gateway run
+          SCRIPT
+
+          az vm run-command invoke \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --name ${{ env.VM_NAME }} \
+            --command-id RunShellScript \
+            --scripts @redeploy.sh \
+            --parameters "${{ env.IMAGE }}:${{ github.sha }}"
