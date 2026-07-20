@@ -68,7 +68,7 @@ jobs:
           IMAGE="$1"
 
           # Reuse the running container's own HERMES_*/FRANK_* env vars —
-          # no secret values are passed through CI. Requires frank-hermes
+          # no secret values are passed through CI. Requires quincy-hermes
           # to already be running (true after the one-off initial `docker
           # run` documented in docs/azure-deployment.md). Each var becomes
           # its own `-e` + value array entry (not one combined string —
@@ -77,7 +77,7 @@ jobs:
           # confirmed live 2026-07-11, which briefly took frank-control
           # down after a test redeploy).
           mapfile -t ENV_VARS < <(
-            docker inspect frank-hermes --format '{{range .Config.Env}}{{println .}}{{end}}' \
+            docker inspect quincy-hermes --format '{{range .Config.Env}}{{println .}}{{end}}' \
               | grep -E '^(HERMES_|FRANK_)'
           )
           ENV_FLAGS=()
@@ -86,9 +86,9 @@ jobs:
           done
 
           docker pull "$IMAGE"
-          docker stop frank-hermes
-          docker rm frank-hermes
-          docker run -d --name frank-hermes --restart unless-stopped \
+          docker stop quincy-hermes
+          docker rm quincy-hermes
+          docker run -d --name quincy-hermes --restart unless-stopped \
             -p 8910:8910 \
             -v /opt/hermes-data:/opt/data \
             "${ENV_FLAGS[@]}" \
