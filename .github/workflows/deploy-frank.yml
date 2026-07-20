@@ -28,10 +28,10 @@ permissions:
   contents: read
 
 env:
-  REGISTRY: frankingestablcr.azurecr.io
-  IMAGE: frankingestablcr.azurecr.io/frank-hermes
-  RESOURCE_GROUP: frank-ingest-rg
-  VM_NAME: frank-hermes-vm
+  REGISTRY: quincyacreg.azurecr.io
+  IMAGE: quincyacreg.azurecr.io/quincy-hermes
+  RESOURCE_GROUP: quincy
+  VM_NAME: quincy-hermes-vm
 
 jobs:
   build-and-deploy:
@@ -43,12 +43,6 @@ jobs:
       - name: Azure login (OIDC)
         uses: azure/login@v2
         with:
-          # TODO: replace with the client-id of a NEW Azure AD app
-          # registration + federated credential scoped to
-          # FilippTrigub/hermes-agent (branch frank-quincy-integration) —
-          # do not reuse frank-ingest's client-id, its federated credential
-          # subject claim is scoped to a different repo. See
-          # docs/azure-deployment.md for the one-off setup commands.
           client-id: ${{ secrets.AZURE_HERMES_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
@@ -63,7 +57,7 @@ jobs:
         # "the --chmod option requires BuildKit"). az acr login reuses the
         # already-authenticated OIDC session from the step above.
         run: |
-          az acr login --name frankingestablcr
+          az acr login --name quincyacreg
           docker buildx build --push -t ${{ env.IMAGE }}:${{ github.sha }} .
 
       - name: Deploy new image to the VM
