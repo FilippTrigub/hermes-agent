@@ -109,6 +109,41 @@ ADMIN_TOOLS = [
 ]
 VOLUNTEER_TOOLS = ["get_my_lists", "get_list_voters", "submit_result"]
 
+# The Hermes-side toolset allowlist, which is a different thing from the MCP
+# allowlists above and guards a much larger hole.
+#
+# Hermes resolves a profile's tools per *platform*. frank_control drives the
+# `api_server` platform (the OpenAI-compatible gateway that /frank/chat proxies
+# to), and when a profile's config.yaml has no `platform_toolsets` key at all,
+# hermes_cli/tools_config.py falls through to that platform's default toolset --
+# `hermes-api-server`, which grants `terminal`, `execute_code`, `write_file`,
+# `patch`, `delegate_task`, `cronjob` and full browser automation.
+#
+# Every campaign's profile directory lives on one shared VM, and each profile's
+# .env holds that campaign's MCP API key plus the Azure model key. So the
+# fall-through gave every campaign's assistant -- including the VOLUNTEER role,
+# the least-trusted user in the product -- a shell capable of reading every other
+# campaign's credentials. Hermes's own approval engine does not close this on
+# this path: register_gateway_notify is wired only in _handle_runs
+# (gateway/platforms/api_server.py), not in the _run_agent path that serves
+# /v1/chat/completions, so a gated call has nobody to prompt and soft-denies
+# into the model's context instead.
+#
+# These three are local-state only: no shell, no filesystem, no network egress,
+# no code execution. MCP servers are resolved separately from toolsets (see
+# include_default_mcp_servers in tools_config.py), so naming an explicit list
+# here does not disturb ADMIN_TOOLS/VOLUNTEER_TOOLS above -- verified live
+# before this went in.
+FRANK_PLATFORM_TOOLSETS = ["memory", "todo", "session_search"]
+
+# Toolset groups that must never resolve for a frank profile. Named here rather
+# than left implicit so the test has something to assert against, and so that a
+# future edit widening FRANK_PLATFORM_TOOLSETS fails loudly.
+FRANK_FORBIDDEN_TOOLSETS = frozenset({
+    "terminal", "code_execution", "file", "browser",
+    "delegation", "cronjob", "skills", "web", "vision", "image_gen",
+})
+
 
 def _validate_slug(slug: str) -> str:
     slug = (slug or "").strip().lower()
@@ -214,6 +249,12 @@ def _write_mcp_and_model(
                 status_code=500, detail=f"MCP entry rejected: {'; '.join(issues)}"
             )
         cfg.setdefault("mcp_servers", {})["frank-ingest"] = entry
+
+        # Explicit, so the api_server platform never falls through to the
+        # `hermes-api-server` default toolset. See FRANK_PLATFORM_TOOLSETS.
+        cfg.setdefault("platform_toolsets", {})["api_server"] = list(
+            FRANK_PLATFORM_TOOLSETS
+        )
 
         provider = os.environ.get("FRANK_MODEL_PROVIDER", "").strip()
         model = os.environ.get("FRANK_MODEL_NAME", "").strip()
