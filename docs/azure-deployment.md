@@ -15,8 +15,8 @@ Moving to a VM sidesteps this entirely: `HERMES_HOME` is a directory on the VM's
 ## What's actually provisioned
 
 - **VM**: `quincy-hermes-vm` in resource group `quincy` (Central US), `Standard_D2als_v7` (2 vCPU / 4 GiB), Ubuntu 24.04 LTS, Premium SSD OS disk (Hermes's per-profile SQLite files are tiny — no separate data disk).
-- **Networking**: a dedicated VNet/subnet (`quincy-hermes-vnet`, `10.20.0.0/24`, subnet `default`) and NSG (`quincy-hermes-nsg`), **not** `quincy-env`'s network. Standard-SKU **static** public IP (`quincy-hermes-vm-ip`, no DNS label). NSG allows inbound TCP 8910 from anywhere (see "Network exposure" below) and TCP 22 (SSH) restricted to the operator's own IP.
-- **The container**: name `quincy-hermes`, image `quincyacreg.azurecr.io/quincy-hermes:<sha>`, started with `docker run --restart unless-stopped` — Docker's own restart policy plus `docker.service` starting on boot is the entire supervision story; no extra systemd unit. Env: `HERMES_FRANK_CONTROL=true`, `FRANK_CONTROL_HOST=0.0.0.0`, `FRANK_CONTROL_PORT=8910`, `HERMES_HOME=/opt/data`, `FRANK_MODEL_PROVIDER=azure-foundry`, `FRANK_MODEL_NAME`, `FRANK_MODEL_BASE_URL`, `FRANK_MODEL_API_KEY`, `FRANK_PROVISION_SECRET`.
+- **Networking**: a dedicated VNet/subnet (`quincy-hermes-vnet`, `10.20.0.0/24`, subnet `default`) and NSG (`quincy-hermes-nsg`), **not** `quincy-env`'s network. Standard-SKU **static** public IP (`quincy-hermes-vm-ip`), fronted by `agent.quincy.run`. NSG allows inbound TCP 443 (the Caddy TLS terminator, see "Network exposure" below) and TCP 22 (SSH) restricted to the operator's own IP.
+- **The containers**: `quincy-hermes` (image `quincyacreg.azurecr.io/quincy-hermes:<sha>`, published to `127.0.0.1:8910` only) and `caddy` (official `caddy:2`, `--network host`, config at `/opt/caddy/Caddyfile`, certificates at `/opt/caddy/data`). Both `docker run --restart unless-stopped` — Docker's own restart policy plus `docker.service` starting on boot is the entire supervision story; no extra systemd unit. Env: `HERMES_FRANK_CONTROL=true`, `FRANK_CONTROL_HOST=0.0.0.0`, `FRANK_CONTROL_PORT=8910`, `HERMES_HOME=/opt/data`, `FRANK_MODEL_PROVIDER=azure-foundry`, `FRANK_MODEL_NAME`, `FRANK_MODEL_BASE_URL`, `FRANK_MODEL_API_KEY`, `FRANK_PROVISION_SECRET`.
 - **Registry**: `quincyacreg` (`quincyacreg.azurecr.io`), in the same `quincy` resource group.
 - **Model/provider**: Azure AI Foundry resource **`quincy-resource`** (resource group `NetworkWatcherRG`, East US), deployment `gpt-5.6-luna` (was `gpt-5.4-mini` until 2026-09-15), reached via Hermes's native `azure-foundry` provider with `FRANK_MODEL_BASE_URL=https://quincy-resource.cognitiveservices.azure.com/openai?api-version=2025-04-01-preview`. Hermes appends the API path itself. The same resource and the same key also serve `quincy`'s own Azure OpenAI calls **and** its Azure Speech calls — see "Rotating keys" below, because that coupling is not obvious and makes a key rotation wider than it looks.
 - **GitHub OIDC**: Azure AD app registration `quincy-hermes-deploy` (appId `b4228de9-96c1-4257-a68e-217063fc6723`), holding **Virtual Machine Contributor scoped to just the `quincy-hermes-vm` resource** — needed for `az vm run-command invoke`, which is how `deploy-frank.yml` ships new images — plus `AcrPush` on `quincyacreg`. Repo secrets `AZURE_HERMES_CLIENT_ID`/`AZURE_TENANT_ID`/`AZURE_SUBSCRIPTION_ID` on `FilippTrigub/hermes-agent`. **No model key or provision secret is a GitHub secret** — see below.
@@ -30,11 +30,33 @@ Two things surprise people, and both have cost real debugging time:
 
 ## Network exposure
 
-`frank_control` is reachable at `http://<vm-public-ip>:8910` — plain HTTP, not fronted by TLS. The access control is the `FRANK_PROVISION_SECRET` bearer auth built into `frank_control/app.py` (`hmac.compare_digest`-checked on every request, minimum 43 characters).
+`frank_control` is reachable at **`https://agent.quincy.run`** only. A Caddy container on the
+VM (`--network host`) terminates TLS with a Let's Encrypt certificate and reverse-proxies to
+the hermes container, which publishes to **`127.0.0.1:8910`** and is not reachable from
+outside the host. `quincy-hermes-nsg` allows 443 and SSH from the operator's IP; the old
+`allow-8910` rule is gone. Access control is still the `FRANK_PROVISION_SECRET` bearer auth
+in `frank_control/app.py`, but it is no longer the *only* thing standing between the internet
+and the control API, and the secret no longer crosses the wire in cleartext.
 
-The NSG's port-8910 rule is open to any source rather than scoped to the caller. This is not an oversight: `quincy-env` is a Consumption-plan Container Apps environment with no VNet integration, and `quincy`'s egress was measured at **160+ addresses across unrelated /16s**, so there is no bounded set to scope a rule to. Fixing that properly needs a VNet-integrated environment, which cannot be done in place — VNet config is immutable after environment creation.
+Details worth keeping:
 
-**TLS fronting is planned and is no longer "out of scope".** The implementation plan lives in the private `frank-ingest` repo (`docs/plans/2026-09-15-hermes-tls-fronting.md`) rather than here, because until it ships it describes a live weakness and this repository is a public fork.
+- **The certificate is for `agent.quincy.run`, not an Azure DNS label.** `cloudapp.azure.com`
+  has been removed from the Public Suffix List, so Let's Encrypt buckets `*.cloudapp.azure.com`
+  under `azure.com` — a rate-limit pool shared with every Azure tenant, and a renewal failure
+  nobody here could control. A domain we own avoids that entirely.
+- **TLS-ALPN-01 on 443, HTTP-01 disabled.** Port 80 never has to be opened. If you ever close
+  443, renewal stops — but the service is already unreachable at that point, so it is not a
+  hidden failure.
+- **Certificates live on the host** at `/opt/caddy/data`, bind-mounted into the container, so
+  they survive `docker rm` and reboots.
+- **`-p 127.0.0.1:8910:8910` lives in `deploy-frank.yml`.** The deploy recreates the container
+  from scratch every run, so without it the next deploy would republish on `0.0.0.0` and
+  silently reopen the hole. `FRANK_CONTROL_HOST` stays `0.0.0.0` — that is uvicorn's bind
+  address *inside* the container, and changing it breaks `docker-proxy`.
+- **The NSG source range is still `*` on 443.** `quincy-env` is a Consumption-plan Container
+  Apps environment with no VNet integration, and `quincy`'s egress measures 160+ addresses
+  across unrelated /16s, so there is no bounded set to scope to. Narrowing it needs a
+  VNet-integrated environment, which cannot be done in place.
 
 ## Deploying new images
 
