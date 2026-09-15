@@ -98,7 +98,7 @@ jobs:
           # is a public fork, so every run before 2026-09-15 published both values.
           set +x
           docker run -d --name quincy-hermes --restart unless-stopped \
-            -p 8910:8910 \
+            -p 127.0.0.1:8910:8910 \
             -v /opt/hermes-data:/opt/data \
             "${ENV_FLAGS[@]}" \
             "$IMAGE" gateway run
