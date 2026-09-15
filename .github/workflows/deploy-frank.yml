@@ -14,7 +14,9 @@ name: Build and deploy frank-hermes to its VM
 # script on the VM via `az vm run-command invoke` (no SSH key needed in
 # CI): it reads the currently-running container's own HERMES_*/FRANK_* env
 # vars and recreates it with the new image, so no secret values are ever
-# passed through GitHub Actions. The VM itself (network, Docker install,
+# passed IN through GitHub Actions secrets. They can still come back OUT:
+# run-command returns the script's stderr, so the docker run that carries them
+# is executed with tracing disabled. See the note at that line. The VM itself (network, Docker install,
 # initial container run, env vars) is provisioned once via documented
 # one-off `az` commands — see docs/azure-deployment.md — not by this workflow.
 
@@ -88,11 +90,19 @@ jobs:
           docker pull "$IMAGE"
           docker stop quincy-hermes
           docker rm quincy-hermes
+
+          # Tracing OFF for this one command. ENV_FLAGS holds the container's real
+          # FRANK_PROVISION_SECRET and FRANK_MODEL_API_KEY, and `set -x` echoes the
+          # expanded command line to stderr -- which `az vm run-command invoke` returns
+          # in its JSON, which GitHub prints into this workflow's log. This repository
+          # is a public fork, so every run before 2026-09-15 published both values.
+          set +x
           docker run -d --name quincy-hermes --restart unless-stopped \
             -p 8910:8910 \
             -v /opt/hermes-data:/opt/data \
             "${ENV_FLAGS[@]}" \
             "$IMAGE" gateway run
+          set -x
           SCRIPT
 
           az vm run-command invoke \
