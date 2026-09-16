@@ -250,10 +250,18 @@ def _refresh_profile(profile_dir: Path, role: str, campaign_slug: str) -> None:
     * ``model`` — pinned per profile at creation on purpose; see docs/azure-deployment.md.
     * ``memories/``, ``sessions/``, the databases, and the gateway's own runtime files.
 
-    No gateway restart is needed. /frank/chat proxies to the profile's api_server, which builds
-    a fresh agent per request: config.yaml is re-read through an mtime-keyed cache and SOUL.md is
-    read off disk by load_soul_md each time. Only .env is read at process start, and .env is
-    exactly what this does not touch.
+    **A prompt change lands without a restart; a tool-allowlist change does not.** /frank/chat
+    builds a fresh agent per request and load_soul_md reads SOUL.md off disk each time, so new
+    prompt text is live immediately. The MCP tool list is not: the profile's MCP session is
+    established when the gateway process starts, so a tool added to tools.include stays invisible
+    to the model until that profile's gateway is restarted. Measured on the real service on
+    2026-09-16 — after a refresh the assistant had the new prompt and answered "the campaign-goal
+    tool isn't available in this session", and the same request succeeded after
+    `hermes_cli.main -p <profile> gateway restart`.
+
+    The restart is left to the operator rather than done here: this endpoint is called on a path
+    that must stay a no-op for a healthy campaign, and bouncing a gateway mid-conversation is not
+    something a refresh should decide on its own.
     """
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
     from hermes_cli.config import load_config, save_config
@@ -375,8 +383,9 @@ async def provision(body: ProvisionRequest, request: Request) -> dict[str, Any]:
                 created[role] = {"name": name, "already_existed": True, "refreshed": True}
             else:
                 created[role] = {"name": name, "already_existed": True}
-            # No _start_gateway here either way: the profile's gateway is already running,
-            # and a refresh needs no restart to be picked up (see _refresh_profile).
+            # No _start_gateway here either way: the profile's gateway is already running.
+            # Note a refresh is not fully live until that gateway is restarted if the tool
+            # allowlist changed — see _refresh_profile. Prompt-only changes need nothing.
             continue
 
         path = profiles_mod.create_profile(

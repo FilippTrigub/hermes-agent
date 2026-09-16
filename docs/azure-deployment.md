@@ -94,7 +94,9 @@ Not committed anywhere. Read it from the running container with `docker inspect 
 
 **The prompt and the tool allowlist are no longer in that list.** `POST /frank/provision` takes `refresh: true`, which rewrites an existing profile's `SOUL.md`, its MCP `tools.include` and its `platform_toolsets` from what is in this repo, and touches nothing else — not `.env`, not the MCP `x-api-key`, not `model`, not memory or sessions. It is off by default, because frank-ingest's lazy path calls provision on every "not provisioned" error and mints a fresh campaign key each time.
 
-No gateway restart is needed: `/frank/chat` proxies to the profile's api_server, which builds a fresh agent per request, re-reads `config.yaml` through an mtime-keyed cache and reads `SOUL.md` off disk each time. Only `.env` is read at process start, and a refresh does not touch it. Roll a change out per campaign with:
+**A prompt change needs no restart. A tool-allowlist change does.** `/frank/chat` builds a fresh agent per request and reads `SOUL.md` off disk each time, so new prompt text is live at once. The MCP tool list is bound when the profile's gateway process starts, so a tool added to `tools.include` stays invisible until that gateway restarts. Verified on the real service on 2026-09-16: straight after a refresh the assistant had the new prompt but answered "the campaign-goal tool isn't available in this session", and the same request succeeded after a restart.
+
+Roll a change out per campaign with:
 
 ```
 curl -sS -X POST https://agent.quincy.run/frank/provision \
@@ -102,3 +104,12 @@ curl -sS -X POST https://agent.quincy.run/frank/provision \
   -H 'Content-Type: application/json' \
   -d '{"campaign_id":"<uuid>","campaign_slug":"<uuid>","mcp_url":"https://app.quincy.run/api/mcp","mcp_api_key":"unused-on-refresh","refresh":true}'
 ```
+
+then, if the tool allowlist changed, restart both of that campaign's gateways:
+
+```
+docker exec -e HERMES_NONINTERACTIVE=1 quincy-hermes \
+  python -m hermes_cli.main -p frank-<uuid>-admin gateway restart
+```
+
+Run the curl from inside the container (`docker exec quincy-hermes sh -c '...'`) so `FRANK_PROVISION_SECRET` never leaves the VM. Note `gateway.pid` under a profile directory is not a reliable liveness signal — the gateways are s6 services, and the file read stale for every profile while all eight were in fact serving. Check liveness with a `/frank/chat` request instead.
