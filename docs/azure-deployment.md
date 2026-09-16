@@ -90,4 +90,15 @@ Not committed anywhere. Read it from the running container with `docker inspect 
 
 - Initial VM/network/NSG creation and the first `docker run` — one-off, human-confirmed.
 - Key and secret rotation — manual and coordinated across both sides, per "Rotating keys" above.
-- Rewriting existing profiles' `config.yaml` — `provision` is idempotent by short-circuit, so a model or tool-allowlist change reaches existing campaigns only if those files are edited directly.
+- Rewriting an existing profile's **model** — `provision` short-circuits on `profile_exists`, and the refresh below deliberately leaves `model` alone, so a model change still reaches existing campaigns only by editing those files directly.
+
+**The prompt and the tool allowlist are no longer in that list.** `POST /frank/provision` takes `refresh: true`, which rewrites an existing profile's `SOUL.md`, its MCP `tools.include` and its `platform_toolsets` from what is in this repo, and touches nothing else — not `.env`, not the MCP `x-api-key`, not `model`, not memory or sessions. It is off by default, because frank-ingest's lazy path calls provision on every "not provisioned" error and mints a fresh campaign key each time.
+
+No gateway restart is needed: `/frank/chat` proxies to the profile's api_server, which builds a fresh agent per request, re-reads `config.yaml` through an mtime-keyed cache and reads `SOUL.md` off disk each time. Only `.env` is read at process start, and a refresh does not touch it. Roll a change out per campaign with:
+
+```
+curl -sS -X POST https://agent.quincy.run/frank/provision \
+  -H "Authorization: Bearer $FRANK_PROVISION_SECRET" \
+  -H 'Content-Type: application/json' \
+  -d '{"campaign_id":"<uuid>","campaign_slug":"<uuid>","mcp_url":"https://app.quincy.run/api/mcp","mcp_api_key":"unused-on-refresh","refresh":true}'
+```

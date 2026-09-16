@@ -106,6 +106,10 @@ ADMIN_TOOLS = [
     "list_target_groups", "get_target_group", "create_target_group", "update_target_group",
     "generate_lists", "get_list_generation_job",
     "assign_list", "record_voter_result", "get_volunteers", "distribute_lists",
+    # Registered on frank-ingest's MCP server 2026-09-16. They had been declared in
+    # lib/admin-assistant-tools.ts since 2026-06-26 and never registered, so the admin
+    # prompt used to say the assistant had no way to set a goal or a target.
+    "add_goal", "complete_goal", "who_am_i",
 ]
 VOLUNTEER_TOOLS = ["get_my_lists", "get_list_voters", "submit_result"]
 
@@ -227,6 +231,48 @@ def _write_soul(profile_dir: Path, role: str, campaign_slug: str) -> None:
     (profile_dir / "SOUL.md").write_text(text)
 
 
+def _refresh_profile(profile_dir: Path, role: str, campaign_slug: str) -> None:
+    """Rewrite the parts of an existing profile that are pure policy.
+
+    Provisioning short-circuits on ``profile_exists``, so a profile is written once and never
+    again. That is correct for everything that carries state, and wrong for everything that is
+    just a rendering of what is in this repo: the role's prompt, the MCP tool allowlist and the
+    platform toolsets. Before this existed, a prompt or tool change reached only campaigns
+    created after it, and the eight live profiles had to be edited by hand on the VM.
+
+    Deliberately untouched, because each holds state a rewrite would destroy:
+
+    * ``.env`` — ``API_SERVER_PORT`` (rewriting it hands out a new port while the running
+      gateway still listens on the old one, and /frank/chat reads the port back from here),
+      ``API_SERVER_KEY`` (the bearer the proxy presents) and ``AZURE_FOUNDRY_API_KEY``.
+    * the MCP ``x-api-key`` header — every provision call from frank-ingest mints a fresh
+      campaign key, so rewriting it on a refresh would burn a key row per call.
+    * ``model`` — pinned per profile at creation on purpose; see docs/azure-deployment.md.
+    * ``memories/``, ``sessions/``, the databases, and the gateway's own runtime files.
+
+    No gateway restart is needed. /frank/chat proxies to the profile's api_server, which builds
+    a fresh agent per request: config.yaml is re-read through an mtime-keyed cache and SOUL.md is
+    read off disk by load_soul_md each time. Only .env is read at process start, and .env is
+    exactly what this does not touch.
+    """
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_cli.config import load_config, save_config
+
+    _write_soul(profile_dir, role, campaign_slug)
+
+    tools_include = ADMIN_TOOLS if role == "admin" else VOLUNTEER_TOOLS
+    token = set_hermes_home_override(str(profile_dir))
+    try:
+        cfg = load_config()
+        server = cfg.setdefault("mcp_servers", {}).get("frank-ingest")
+        if isinstance(server, dict):
+            server.setdefault("tools", {})["include"] = list(tools_include)
+        cfg.setdefault("platform_toolsets", {})["api_server"] = list(FRANK_PLATFORM_TOOLSETS)
+        save_config(cfg)
+    finally:
+        reset_hermes_home_override(token)
+
+
 def _write_mcp_and_model(
     profile_dir: Path, *, mcp_url: str, mcp_api_key: str, tools_include: list[str]
 ) -> None:
@@ -306,6 +352,12 @@ class ProvisionRequest(BaseModel):
     campaign_slug: str
     mcp_url: str
     mcp_api_key: str
+    # Rewrite an existing profile's prompt and tool allowlist instead of skipping it.
+    # Off by default, so both of frank-ingest's callers keep the no-op semantics they
+    # rely on: lib/hermes-chat.ts calls provision on every "not provisioned" error and
+    # mints a fresh campaign MCP key each time, and coupling a prompt refresh to that
+    # would burn a key row per refresh.
+    refresh: bool = False
 
 
 @app.post("/frank/provision")
@@ -318,7 +370,13 @@ async def provision(body: ProvisionRequest, request: Request) -> dict[str, Any]:
     for role in _ROLES:
         name = _profile_name(slug, role)
         if profiles_mod.profile_exists(name):
-            created[role] = {"name": name, "already_existed": True}
+            if body.refresh:
+                _refresh_profile(profiles_mod.get_profile_dir(name), role, slug)
+                created[role] = {"name": name, "already_existed": True, "refreshed": True}
+            else:
+                created[role] = {"name": name, "already_existed": True}
+            # No _start_gateway here either way: the profile's gateway is already running,
+            # and a refresh needs no restart to be picked up (see _refresh_profile).
             continue
 
         path = profiles_mod.create_profile(
