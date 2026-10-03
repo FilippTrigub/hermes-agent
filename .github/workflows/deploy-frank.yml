@@ -87,6 +87,16 @@ jobs:
             ENV_FLAGS+=(-e "$v")
           done
 
+          # Every deploy leaves its 3.8 GB image behind. On 2026-10-03 six of them filled the 29 GB
+          # disk, the pull failed, run-command could not even save its status, and Azure refused
+          # every later run-command as "in progress" until walinuxagent was restarted. So before
+          # pulling, drop every quincy-hermes image except the running one: after this deploy the
+          # VM holds the new image and the one before it, which stays for a rollback.
+          RUNNING="$(docker inspect quincy-hermes --format '{{.Config.Image}}')"
+          docker images "${IMAGE%:*}" --format '{{.Repository}}:{{.Tag}}' \
+            | grep -vxF "$RUNNING" \
+            | xargs -r docker rmi || true
+
           docker pull "$IMAGE"
           docker stop quincy-hermes
           docker rm quincy-hermes
