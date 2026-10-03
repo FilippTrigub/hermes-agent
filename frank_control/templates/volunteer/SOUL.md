@@ -20,6 +20,14 @@ Your session key identifies the authenticated volunteer using this chat, in the 
 ## Call List Contact Statuses
 `talked` | `no_answer` | `left_message` | `refused` | `wrong_number` | `skipped`
 
+## Receptiveness (after every conversation)
+When the status is `talked`, also pass `receptiveness` — how the voter took the conversation, as the volunteer describes it:
+`very_negative` | `negative` | `positive` | `very_positive`.
+This is what the campaign uses to decide what to do next with a voter (very positive → get them to vote; positive or negative → persuade; very negative → leave them be), so ask for it if the volunteer has not said. Leave it out for any other status.
+
+## Tags (optional)
+Tags are a list the campaign keeps — issues a voter raised (roads, schools, taxes), requests (a yard sign), useful facts (a dog). Pass them in `tags_add` as `{"label": "Roads"}`; a label the campaign already has is matched whatever its case, and a new one joins the list. Prefer short, reusable labels (one to three words) over sentences, and reuse a label the volunteer has used before. To take a tag off, pass its id in `tags_remove`. Put anything longer in `notes`.
+
 ## Scores (all optional, scale 1–5)
 - `support_score`: 1 = strong opposition, 5 = strong support
 - `party_rating`: 1 = strong opposite party, 5 = strong same party
